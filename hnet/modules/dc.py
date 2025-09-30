@@ -13,9 +13,18 @@ from hnet.modules.utils import get_seq_idx
 
 @dataclass
 class RoutingModuleOutput:
-    boundary_prob: torch.Tensor
-    boundary_mask: torch.Tensor
-    selected_probs: torch.Tensor
+    #输入B = 1, L = 3
+    boundary_prob: torch.Tensor #(B,L,2) [..., 0]是边界的概率 [..., 1]不是边界的概率 
+    #例如：
+    #[0.00, 1.00] 第一个token一定是边界
+    #[0.25, 0.75] 第二个token有25%的概率是边界
+    #[0.60, 0.40] 第三个token有60%的概率是边界
+    boundary_mask: torch.Tensor #(B,L) 
+    #例如：
+    #[True, False, True] 第二个token不是边界，第三个token是边界
+    selected_probs: torch.Tensor #(B,L,1) 对选中的类别取max
+    #例如：
+    #[1.00, 0.75, 0.60] 第一个选中了"边界"的概率是1.00，第二个选中了"不是边界"的概率是0.75，第三个选中了"边界"的概率是0.60
 
 
 @dataclass
@@ -47,30 +56,37 @@ class DeChunkState:
 class RoutingModule(nn.Module):
 
     def __init__(self, d_model, device=None, dtype=None):
+        #d_model 隐藏维度大小
+        #device 设备
+        #dtype 数据类型
         self.d_model = d_model
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
-        self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs) # ** 字典解包， *元组/列表解包
+        self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs) 
         with torch.no_grad():
-            self.q_proj_layer.weight.copy_(torch.eye(d_model))
+            self.q_proj_layer.weight.copy_(torch.eye(d_model)) #初始化为单位矩阵
             self.k_proj_layer.weight.copy_(torch.eye(d_model))
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
 
+    # 分配推理缓存
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return RoutingModuleState(
-            has_seen_tokens=torch.zeros(batch_size, device=device, dtype=torch.bool),
+            has_seen_tokens=torch.zeros(batch_size, device=device, dtype=torch.bool), #(B,) 这个样本是否见过token
             last_hidden_state=torch.zeros(
                 batch_size, self.d_model, device=device, dtype=dtype
-            ),
+            ), #(B, D)
         )
 
+    # 前向传播
     def forward(self, hidden_states, cu_seqlens=None, mask=None, inference_params=None):
+        #入口与模式检查
         assert (mask is not None) or (
             cu_seqlens is not None
         ), "Either mask or cu_seqlens must be provided"
 
+        #预填时的额外约数
         if inference_params is not None:
             assert (
                 mask is not None
@@ -79,9 +95,10 @@ class RoutingModule(nn.Module):
                 ~inference_params.has_seen_tokens
             ).all(), "Cannot have seen tokens when inference_params is not provided"
 
+        #packed形状对齐
         if cu_seqlens is not None:
             # We are in packed mode, so hidden_states is (T, D). Make it (B, T, D)
-            hidden_states = hidden_states.unsqueeze(0)
+            hidden_states = hidden_states.unsqueeze(0) #(1, T, D)
 
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
@@ -89,10 +106,14 @@ class RoutingModule(nn.Module):
             F.normalize(self.k_proj_layer(hidden_states[:, 1:]), dim=-1),
         )
         # this clamp should no-op as long as no precision issues are encountered
+        #torch.clamp()用来截断数值到指定区间
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
 
         # Force boundary probability of the first element to 1.0
         PAD_PROB = 1.0
+        #F.pad(x, pad, mode, value)
+        #pad在最后一维的前面补1个元素，值为PAD_PROB; 右侧补0个元素
+        #例如 boundary_prob = [0.25, 0.75], 经过pad后变为 [1.00, 0.25, 0.75]
         boundary_prob = F.pad(boundary_prob, (1, 0), "constant", PAD_PROB)
 
         if cu_seqlens is not None:
